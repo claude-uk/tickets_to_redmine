@@ -1,6 +1,7 @@
 --migrator.sql
 --migrates the tickets database to the redmine database
---claude
+--usage: sqlite3 < migrator.sql
+--claude gierl
 --version01 27.02.15
 
 attach database 'tickets.db' as 'tic';
