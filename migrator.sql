@@ -59,7 +59,7 @@ INSERT INTO priority_mapping SELECT tic.severity.id, rm.enumerations.id FROM tic
 --the 'n/a' survey with its 'n/a' sweep becomes a second-level project.
 --apart from 'n/a' sweep and survey names are unique within a joint set.
 --The projects use a 'nested set' structure.
---to do: rigth and left values
+--to do: rigth and left values, projects don't display without it
 INSERT INTO rm.projects (name, identifier) values ("Tickets", "Tickets");
 INSERT INTO rm.projects (name, identifier, parent_id)
 	SELECT tic.survey.name, tic.survey.name, rm.projects.id
