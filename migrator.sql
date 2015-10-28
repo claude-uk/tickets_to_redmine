@@ -8,7 +8,8 @@
 attach database 'tickets.db' as 'tic';
 attach database 'redmine.sqlite3' as 'rm';
 
-----system level options 
+----system level options
+INSERT INTO rm.settings (name, value) values ('default_language', 'en-GB');
 
 ----query_type to tracker
 --keep the default redmine items 'Bug','Feature', 'Support', not used in tickets
@@ -32,15 +33,8 @@ INSERT INTO rm.trackers (name)
 UPDATE rm.issue_statuses set position = position + 1 where position > 1;
 INSERT INTO rm.issue_statuses (name, is_closed, position) values ('Allocated', 'f', 2);
 INSERT INTO rm.issue_statuses (name, is_closed, position) values ('Unresolved', 't', 8);
-
-----add worklow for new trackers for role Manager (all possible transitions)
---I don't add anything for the default trackers (1,2,3)
-INSERT INTO rm.workflows (tracker_id, old_status_id, new_status_id, role_id, type)
-	SELECT rm.trackers.id, os.id, ns.id, rm.roles.id, "WorkflowTransition"
-	FROM rm.trackers, rm.issue_statuses as os, rm.issue_statuses as ns, rm.roles
-	WHERE rm.trackers.id > 3
-	AND rm.roles.name = "Manager"
-	AND os.id != ns.id;
+--we consider resolved as being closed, whereas in redmine it was not closed
+UPDATE rm.issue_statuses set is_closed = 't' where name = 'Resolved';
 
 --create a temporary mapping table 'old id to new id' for easier job migration
 CREATE TEMP TABLE status_mapping ( tickets_id integer, redmine_id integer);
@@ -51,6 +45,15 @@ INSERT INTO status_mapping SELECT tic.status.id, rm.issue_statuses.id FROM tic.s
 INSERT INTO status_mapping SELECT tic.status.id, rm.issue_statuses.id FROM tic.status, rm.issue_statuses WHERE tic.status.name =  'Cancelled' AND rm.issue_statuses.name = 'Rejected';
 INSERT INTO status_mapping SELECT tic.status.id, rm.issue_statuses.id FROM tic.status, rm.issue_statuses WHERE tic.status.name = 'Resolved' AND rm.issue_statuses.name = 'Resolved';
 INSERT INTO status_mapping SELECT tic.status.id, rm.issue_statuses.id FROM tic.status, rm.issue_statuses WHERE tic.status.name = 'Unresolved' AND rm.issue_statuses.name = 'Unresolved';
+
+----add worklow for new trackers for role Manager (all possible transitions)
+--I don't add anything for the default trackers (1,2,3)
+INSERT INTO rm.workflows (tracker_id, old_status_id, new_status_id, role_id, type)
+	SELECT rm.trackers.id, os.id, ns.id, rm.roles.id, "WorkflowTransition"
+	FROM rm.trackers, rm.issue_statuses as os, rm.issue_statuses as ns, rm.roles
+	WHERE rm.trackers.id > 3
+	AND rm.roles.name = "Manager"
+	AND os.id != ns.id;
 
 ----severity to enumerations.name with type='IssuePriority'
 --TICKETS		REDMINE
@@ -81,6 +84,9 @@ INSERT INTO rm.projects (name, identifier, parent_id, inherit_members)
 	WHERE tic.sweep.survey_id = tic.survey.id
 	AND tic.survey.name = rm.projects.name
 	AND tic.sweep.name != "n/a";
+
+--edit name and identifier where it contains a '/' (creates problems in redmine paths)
+UPDATE rm.projects SET name = replace( name, '/', '-' ), identifier = replace( identifier, '/', '-' ) WHERE name LIKE '%/%';
 
 --add nested sets values
 --The projects use a 'nested set' structure.
@@ -116,6 +122,31 @@ UPDATE rm.projects SET name = "Tickets - General", identifier = "Tickets - Gener
 	WHERE name = "n/a";
 UPDATE rm.projects SET name = substr(name, 10) || " - General", identifier = substr(name, 10) || " - General"
 	WHERE name like 'General,%';
+
+----enabled modules in projects
+CREATE TEMP TABLE modules (name varchar(255));
+INSERT INTO modules (name) values ("issue_tracking");
+INSERT INTO modules (name) values ( "time_tracking");
+--INSERT INTO modules (name) values ( "news");
+--INSERT INTO modules (name) values ( "documents");
+--INSERT INTO modules (name) values ( "files");
+INSERT INTO modules (name) values ( "wiki");
+--INSERT INTO modules (name) values ( "repository");
+--INSERT INTO modules (name) values ( "forums");
+INSERT INTO modules (name) values ( "calendar");
+INSERT INTO modules (name) values ( "gantt");
+
+INSERT INTO rm.enabled_modules (project_id, name)
+	SELECT rm.projects.id, modules.name
+	FROM rm.projects, modules;
+
+----associate trackers to projects
+--the first 3 trackers (Bug, Feature, Support) are default redmine trackers and are ignored
+INSERT INTO rm.projects_trackers (project_id, tracker_id)
+	SELECT rm.projects.id, rm.trackers.id
+	FROM rm.projects, rm.trackers
+	WHERE rm.trackers.id > 3; 
+
 
 ----issue categories
 --they don't exist in tickets and seem optional in redmine
@@ -269,7 +300,7 @@ INSERT INTO project_people (user_id, user_type, group_id, project_id, project_na
 	WHERE rm.members.user_id = rm.groups_users.user_id
 	AND rm.members.project_id = rm.projects.id;
 
-SELECT count(*) FROM project_people;
+--SELECT count(*) FROM project_people;
 
 --groups' people into the tickets, ie the members from the tickets project which are not group
 INSERT INTO rm.member_roles (member_id, role_id, inherited_from)
@@ -304,8 +335,8 @@ INSERT INTO rm.member_roles (member_id, role_id, inherited_from)
 
 
 ----job to issue
-INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id)
-    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description, status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description, status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime('now'), datetime('now'), tic.job.created
     FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
     WHERE tic.job.query_type_id = tic.query_type.id
     AND tic.query_type.name = rm.trackers.name
@@ -313,4 +344,8 @@ INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, 
     AND tic.job.status_id = status_mapping.tickets_id
     AND tic.job.severity_id = priority_mapping.tickets_id
     AND tic.job.logger_id = people_mapping.tickets_id;
+
+--add lft and rgt values to issues
+--I assume that the issues are not nested
+UPDATE rm.issues SET lft = id * 2 - 1, rgt = id * 2;
 
