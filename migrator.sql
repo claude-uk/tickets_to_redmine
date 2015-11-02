@@ -1,4 +1,3 @@
-
 --migrator.sql
 --migrates the tickets database to the redmine database
 --usage: sqlite3 < migrator.sql
@@ -10,6 +9,8 @@ attach database 'redmine.sqlite3' as 'rm';
 
 ----system level options
 INSERT INTO rm.settings (name, value) values ('default_language', 'en-GB');
+INSERT INTO rm.settings (name, value) values ('force_default_language_for_anonymous', '1');
+INSERT INTO rm.settings (name, value) values ('force_default_language_for_loggedin', '1');
 
 ----query_type to tracker
 --keep the default redmine items 'Bug','Feature', 'Support', not used in tickets
@@ -24,16 +25,16 @@ INSERT INTO rm.trackers (name)
 --Allocated		(add)
 --In Progress		In Progress
 --Awaiting Info		Feedback
---Cancelled		Rejected
---Resolved		Resolved
---Unresolved		(add)
+--Cancelled		Rejected	closed
+--Resolved		Resolved	closed
+--Unresolved		(add)		closed
 --			Closed
 --schema is name, closed, position...
 --update the position of the ones below before inserting
 UPDATE rm.issue_statuses set position = position + 1 where position > 1;
 INSERT INTO rm.issue_statuses (name, is_closed, position) values ('Allocated', 'f', 2);
 INSERT INTO rm.issue_statuses (name, is_closed, position) values ('Unresolved', 't', 8);
---we consider resolved as being closed, whereas in redmine it was not closed
+--we consider resolved as being closed, whereas in default redmine it is not closed
 UPDATE rm.issue_statuses set is_closed = 't' where name = 'Resolved';
 
 --create a temporary mapping table 'old id to new id' for easier job migration
@@ -47,6 +48,7 @@ INSERT INTO status_mapping SELECT tic.status.id, rm.issue_statuses.id FROM tic.s
 INSERT INTO status_mapping SELECT tic.status.id, rm.issue_statuses.id FROM tic.status, rm.issue_statuses WHERE tic.status.name = 'Unresolved' AND rm.issue_statuses.name = 'Unresolved';
 
 ----add worklow for new trackers for role Manager (all possible transitions)
+--the other roles (fixer, client) don't have any workflow permissions
 --I don't add anything for the default trackers (1,2,3)
 INSERT INTO rm.workflows (tracker_id, old_status_id, new_status_id, role_id, type)
 	SELECT rm.trackers.id, os.id, ns.id, rm.roles.id, "WorkflowTransition"
@@ -69,7 +71,9 @@ INSERT INTO priority_mapping SELECT tic.severity.id, rm.enumerations.id FROM tic
 INSERT INTO priority_mapping SELECT tic.severity.id, rm.enumerations.id FROM tic.severity, rm.enumerations WHERE tic.severity.name = 'Normal' AND rm.enumerations.type = 'IssuePriority' AND rm.enumerations.name = 'Normal';
 INSERT INTO priority_mapping SELECT tic.severity.id, rm.enumerations.id FROM tic.severity, rm.enumerations WHERE tic.severity.name = 'Low' AND rm.enumerations.type = 'IssuePriority' AND rm.enumerations.name = 'Low';
 
-----survey and sweep to projects
+------------------------------------
+----survey and sweep to projects----
+------------------------------------
 --"Tickets" is the top-level project, the surveys are second-level and the sweeps third-level.
 --the 'n/a' survey with its 'n/a' sweep becomes a second-level project.
 --apart from 'n/a' sweep and survey names are unique within a joint set.
@@ -84,9 +88,6 @@ INSERT INTO rm.projects (name, identifier, parent_id, inherit_members)
 	WHERE tic.sweep.survey_id = tic.survey.id
 	AND tic.survey.name = rm.projects.name
 	AND tic.sweep.name != "n/a";
-
---edit name and identifier where it contains a '/' (creates problems in redmine paths)
-UPDATE rm.projects SET name = replace( name, '/', '-' ), identifier = replace( identifier, '/', '-' ) WHERE name LIKE '%/%';
 
 --add nested sets values
 --The projects use a 'nested set' structure.
@@ -123,6 +124,8 @@ UPDATE rm.projects SET name = "Tickets - General", identifier = "Tickets - Gener
 UPDATE rm.projects SET name = substr(name, 10) || " - General", identifier = substr(name, 10) || " - General"
 	WHERE name like 'General,%';
 
+UPDATE rm.projects SET name = replace( name, '/', '-' ), identifier = replace( identifier, '/', '-' ) WHERE name LIKE '%/%';
+
 ----enabled modules in projects
 CREATE TEMP TABLE modules (name varchar(255));
 INSERT INTO modules (name) values ("issue_tracking");
@@ -151,8 +154,9 @@ INSERT INTO rm.projects_trackers (project_id, tracker_id)
 ----issue categories
 --they don't exist in tickets and seem optional in redmine
 
-
-----people
+--------------
+----people----
+--------------
 --in jobs:
 --logger may fit author_id
 --assignee to assigned_to_id
@@ -333,17 +337,89 @@ INSERT INTO rm.member_roles (member_id, role_id, inherited_from)
 	AND ppp.member_id = rm.member_roles.member_id
 	AND cpp.user_id = ppp.user_id;
 
-
-----job to issue
+--------------------
+----job to issue----
+--------------------
+----I need to enter the sets of jobs grouped by status, closed and resolution to get consistent data into redmine
+--created_on gets created and status gets status in all cases
+--jobs with a closed status, a closed date and resolution text or not:
+--updated_on gets closed, the journal a resolution or text 'closed'
 INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
-    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description, status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime('now'), datetime('now'), tic.job.created
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.closed), tic.job.created
     FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
     WHERE tic.job.query_type_id = tic.query_type.id
     AND tic.query_type.name = rm.trackers.name
     AND tic.job.sweep_id = sweep_mapping.tickets_id
     AND tic.job.status_id = status_mapping.tickets_id
     AND tic.job.severity_id = priority_mapping.tickets_id
-    AND tic.job.logger_id = people_mapping.tickets_id;
+    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.status_id > 4
+    AND tic.job.closed IS NOT NULL;
+
+--jobs with a closed status, no closed date and resolution text or not:
+--updated_on gets created, the journal gets the resolution if there is one
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+    WHERE tic.job.query_type_id = tic.query_type.id
+    AND tic.query_type.name = rm.trackers.name
+    AND tic.job.sweep_id = sweep_mapping.tickets_id
+    AND tic.job.status_id = status_mapping.tickets_id
+    AND tic.job.severity_id = priority_mapping.tickets_id
+    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.status_id > 4
+    AND tic.job.closed IS NULL;
+
+--jobs with an open status, no closed date, resolution text:
+--updated_on gets the created date, journal gets the resolution
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+    WHERE tic.job.query_type_id = tic.query_type.id
+    AND tic.query_type.name = rm.trackers.name
+    AND tic.job.sweep_id = sweep_mapping.tickets_id
+    AND tic.job.status_id = status_mapping.tickets_id
+    AND tic.job.severity_id = priority_mapping.tickets_id
+    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.status_id < 5
+    AND tic.job.closed IS NULL
+    AND tic.job.resolution IS NOT NULL AND tic.job.resolution != '';
+
+--jobs with an open status, a closed date, resolution text:
+--updated_on gets the closed date, journal gets the resolution
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.closed), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+    WHERE tic.job.query_type_id = tic.query_type.id
+    AND tic.query_type.name = rm.trackers.name
+    AND tic.job.sweep_id = sweep_mapping.tickets_id
+    AND tic.job.status_id = status_mapping.tickets_id
+    AND tic.job.severity_id = priority_mapping.tickets_id
+    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.status_id < 5
+    AND tic.job.closed IS NOT NULL
+    AND tic.job.resolution IS NOT NULL AND tic.job.resolution != '';
+
+--jobs with an open status, a closed date or not, no resolution text:
+--updated_on gets created, the date is ignored if it exists
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+    WHERE tic.job.query_type_id = tic.query_type.id
+    AND tic.query_type.name = rm.trackers.name
+    AND tic.job.sweep_id = sweep_mapping.tickets_id
+    AND tic.job.status_id = status_mapping.tickets_id
+    AND tic.job.severity_id = priority_mapping.tickets_id
+    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.status_id < 5
+    AND (tic.job.resolution IS NULL OR tic.job.resolution = ''); 
+
+--add the notes by matching the tickets id which was added to the description in redmine
+INSERT INTO rm.journals (journalized_id, journalized_type, user_id, notes, created_on)
+	SELECT rm.issues.id, 'Issue', rm.issues.author_id, tic.job.resolution, rm.issues.updated_on
+	FROM rm.issues, tic.job
+	WHERE rtrim(substr(rm.issues.description, length(rtrim(rm.issues.description,'0123456789)'))),')') = tic.job.id
+	AND tic.job.resolution IS NOT NULL AND tic.job.resolution != '';
 
 --add lft and rgt values to issues
 --I assume that the issues are not nested
