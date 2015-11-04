@@ -7,17 +7,40 @@
 attach database 'tickets.db' as 'tic';
 attach database 'redmine.sqlite3' as 'rm';
 
-----system level options
+----------------------------
+----system level options----
+----------------------------
 INSERT INTO rm.settings (name, value) values ('default_language', 'en-GB');
 INSERT INTO rm.settings (name, value) values ('force_default_language_for_anonymous', '1');
 INSERT INTO rm.settings (name, value) values ('force_default_language_for_loggedin', '1');
 
-----query_type to tracker
+-----------------------------
+----query_type to tracker----
+-----------------------------
 --keep the default redmine items 'Bug','Feature', 'Support', not used in tickets
 --add 'Data', 'Documentation'...
 INSERT INTO rm.trackers (name)
     SELECT name
     FROM tic.query_type;
+
+-------------
+----roles----
+-------------
+--redmine already has a role 'Manager' which I use for the loggers
+--I need a new role 'Fixer' which does not confer any more permissions than role 'Anonymous' as they were not necessarily loggers in Tickets
+--I also need the role 'Client' for users which are only clients
+--roles have a position, eg for project display
+UPDATE rm.roles set position = position + 2 WHERE position > 3;
+
+INSERT INTO rm.roles (name, position, permissions, assignable)
+	SELECT 'Fixer', 4, rm.roles.permissions, 't'
+	FROM rm.roles
+	WHERE rm.roles.name = 'Anonymous';
+
+INSERT INTO rm.roles (name, position, permissions, assignable)
+	SELECT 'Client', 5, rm.roles.permissions, 't'
+	FROM rm.roles
+	WHERE rm.roles.name = 'Anonymous';
 
 ----status to issue_statuses
 --TICKETS		REDMINE
@@ -169,6 +192,7 @@ INSERT INTO rm.projects_trackers (project_id, tracker_id)
 --tickets-admin group has all rights on the tickets project
 --in tickets there were a few people who were fixers but not clients, but this is not important
 --I assume that users get the permissions of the most powerful they belong to and/or that they can move to a new group
+--I assign people to one group only
 INSERT INTO rm.users (lastname, type) values ('Tickets-clients-ext', 'Group');
 INSERT INTO rm.users (lastname, type) values ('Tickets-clients-ioe', 'Group');
 INSERT INTO rm.users (lastname, type) values ('Tickets-fixers', 'Group');
@@ -256,40 +280,55 @@ INSERT INTO people_mapping SELECT tic.tg_user.user_id, rm.users.id
 	WHERE tic.tg_user.email_address = rm.users.mail
 	OR (tic.tg_user.user_name like 'Name not%' and rm.users.firstname = 'Name');
 
-----people as members of projects with a role
+-------------------------------------------------
+----people as members of projects with a role----
+-------------------------------------------------
 --the groups tickets-admin and tickets-managers and their people become members of the 'Tickets' project with role 'Manager'
 --all the other projects inherit the same, but seem to need to be entered in the database explicitely
---create the members for all projects
+--create the members for groups for all projects
 INSERT INTO rm.members (user_id, project_id)
 	SELECT rm.users.id, rm.projects.id
 	FROM rm.users, rm.projects
 	WHERE rm.users.type = 'Group'
-	AND (rm.users.lastname = 'Tickets-managers' OR rm.users.lastname = 'Tickets-admin');
+	AND (rm.users.lastname = 'Tickets-managers' OR rm.users.lastname = 'Tickets-admin' OR rm.users.lastname = 'Tickets-fixers');
 
+--create members for group people for all projects
 INSERT INTO rm.members (user_id, project_id)
 	SELECT rmu.id, rm.projects.id
 	FROM rm.users as rmg, rm.users as rmu, rm.projects, rm.groups_users
 	WHERE rmu.type = 'User'
 	AND rmg.type = 'Group'
-	AND (rmg.lastname = 'Tickets-managers' OR rmg.lastname = 'Tickets-admin')
+	AND (rmg.lastname = 'Tickets-managers' OR rmg.lastname = 'Tickets-admin' OR rmg.lastname = 'Tickets-fixers')
 	AND rmg.id = rm.groups_users.group_id
 	AND rmu.id = rm.groups_users.user_id;
 
 --for the role the inherited_from field shows inheritance through user groups then through the project hierarchy
---groups into tickets project
+--create roles for the groups for the tickets project
 INSERT INTO rm.member_roles (member_id, role_id)
 	SELECT rm.members.id, rm.roles.id
 	FROM rm.members, rm.roles, rm.users, rm.projects
 	WHERE rm.roles.name = 'Manager'
 	AND rm.members.user_id = rm.users.id
 	AND rm.users.type = 'Group'
+	AND (rm.users.lastname = 'Tickets-managers' OR rm.users.lastname = 'Tickets-admin')
 	AND rm.members.project_id = rm.projects.id
 	AND rm.projects.name = 'Tickets';
 
-----do temp table to make things more explicit
+INSERT INTO rm.member_roles (member_id, role_id)
+	SELECT rm.members.id, rm.roles.id
+	FROM rm.members, rm.roles, rm.users, rm.projects
+	WHERE rm.roles.name = 'Fixer'
+	AND rm.members.user_id = rm.users.id
+	AND rm.users.type = 'Group'
+	AND rm.users.lastname = 'Tickets-fixers'
+	AND rm.members.project_id = rm.projects.id
+	AND rm.projects.name = 'Tickets';
+	
+----do temp recapitulative table to make the code more explicit
+--I don't need the role as people belong to a single group and are assigned a single role
 CREATE TEMP TABLE project_people (user_id integer, user_type VARCHAR(255), group_id integer, project_id integer, project_name VARCHAR(255), parent_project_id integer, member_id integer);
 --groups
---there is no group_id, we have a flat hierarchy, groups don't belong to other groups
+--there is no (parent) group_id, we have a flat hierarchy, groups don't belong to other groups
 INSERT INTO project_people (user_id, user_type, project_id, project_name, parent_project_id, member_id)
 	SELECT  rm.members.user_id, 'Group', rm.members.project_id, rm.projects.name, rm.projects.parent_id, rm.members.id
 	FROM rm.members, rm.users, rm.projects
@@ -306,22 +345,20 @@ INSERT INTO project_people (user_id, user_type, group_id, project_id, project_na
 
 --SELECT count(*) FROM project_people;
 
---groups' people into the tickets, ie the members from the tickets project which are not group
+--group people into the tickets project, ie the members from the tickets project which are not a group
 INSERT INTO rm.member_roles (member_id, role_id, inherited_from)
-	SELECT upp.member_id, rm.roles.id, rm.member_roles.id
-	FROM project_people as upp, project_people as gpp, rm.roles, rm.member_roles
-	WHERE rm.roles.name = 'Manager'
-	AND rm.member_roles.inherited_from IS NULL
+	SELECT upp.member_id, rm.member_roles.role_id, rm.member_roles.id
+	FROM project_people as upp, project_people as gpp, rm.member_roles
+	WHERE rm.member_roles.inherited_from IS NULL
 	AND upp.group_id = gpp.user_id
 	AND gpp.member_id = rm.member_roles.member_id
 	AND upp.project_name = 'Tickets';
 
---tickets managers into first level sub-projects
+--tickets members into first level sub-projects
 INSERT INTO rm.member_roles (member_id, role_id, inherited_from)
-	SELECT cpp.member_id, rm.roles.id, rm.member_roles.id
-	FROM project_people as cpp, project_people as ppp, rm.roles, rm.member_roles
-	WHERE rm.roles.name = 'Manager'
-	AND cpp.parent_project_id = ppp.project_id
+	SELECT cpp.member_id, rm.member_roles.role_id, rm.member_roles.id
+	FROM project_people as cpp, project_people as ppp, rm.member_roles
+	WHERE cpp.parent_project_id = ppp.project_id
 	AND ppp.project_name = 'Tickets'
 	AND ppp.member_id = rm.member_roles.member_id
 	AND cpp.user_id = ppp.user_id;
@@ -329,10 +366,9 @@ INSERT INTO rm.member_roles (member_id, role_id, inherited_from)
 --tickets managers into second-level sub-projects
 --nb:if != 'Tickets' is true it means it is not null either
 INSERT INTO rm.member_roles (member_id, role_id, inherited_from)
-	SELECT cpp.member_id, rm.roles.id, rm.member_roles.id
-	FROM project_people as cpp, project_people as ppp, rm.roles, rm.member_roles
-	WHERE rm.roles.name = 'Manager'
-	AND cpp.parent_project_id = ppp.project_id
+	SELECT cpp.member_id, rm.member_roles.role_id, rm.member_roles.id
+	FROM project_people as cpp, project_people as ppp, rm.member_roles
+	WHERE cpp.parent_project_id = ppp.project_id
 	AND ppp.project_name != 'Tickets'
 	AND ppp.member_id = rm.member_roles.member_id
 	AND cpp.user_id = ppp.user_id;
@@ -344,73 +380,78 @@ INSERT INTO rm.member_roles (member_id, role_id, inherited_from)
 --created_on gets created and status gets status in all cases
 --jobs with a closed status, a closed date and resolution text or not:
 --updated_on gets closed, the journal a resolution or text 'closed'
-INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
-    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.closed), tic.job.created
-    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, assigned_to_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, ass.redmine_id, priority_mapping.redmine_id, auth.redmine_id, datetime(tic.job.created), datetime(tic.job.closed), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping as ass, people_mapping as auth
     WHERE tic.job.query_type_id = tic.query_type.id
     AND tic.query_type.name = rm.trackers.name
     AND tic.job.sweep_id = sweep_mapping.tickets_id
     AND tic.job.status_id = status_mapping.tickets_id
     AND tic.job.severity_id = priority_mapping.tickets_id
-    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.logger_id = auth.tickets_id
+    AND tic.job.assignee_id = ass.tickets_id
     AND tic.job.status_id > 4
     AND tic.job.closed IS NOT NULL;
 
 --jobs with a closed status, no closed date and resolution text or not:
 --updated_on gets created, the journal gets the resolution if there is one
-INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
-    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
-    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, assigned_to_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, ass.redmine_id, priority_mapping.redmine_id, auth.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping as ass, people_mapping as auth
     WHERE tic.job.query_type_id = tic.query_type.id
     AND tic.query_type.name = rm.trackers.name
     AND tic.job.sweep_id = sweep_mapping.tickets_id
     AND tic.job.status_id = status_mapping.tickets_id
     AND tic.job.severity_id = priority_mapping.tickets_id
-    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.logger_id = auth.tickets_id
+    AND tic.job.assignee_id = ass.tickets_id
     AND tic.job.status_id > 4
     AND tic.job.closed IS NULL;
 
 --jobs with an open status, no closed date, resolution text:
 --updated_on gets the created date, journal gets the resolution
-INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
-    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
-    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, assigned_to_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, ass.redmine_id, priority_mapping.redmine_id, auth.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping as ass, people_mapping as auth
     WHERE tic.job.query_type_id = tic.query_type.id
     AND tic.query_type.name = rm.trackers.name
     AND tic.job.sweep_id = sweep_mapping.tickets_id
     AND tic.job.status_id = status_mapping.tickets_id
     AND tic.job.severity_id = priority_mapping.tickets_id
-    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.logger_id = auth.tickets_id
+    AND tic.job.assignee_id = ass.tickets_id
     AND tic.job.status_id < 5
     AND tic.job.closed IS NULL
     AND tic.job.resolution IS NOT NULL AND tic.job.resolution != '';
 
 --jobs with an open status, a closed date, resolution text:
 --updated_on gets the closed date, journal gets the resolution
-INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
-    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.closed), tic.job.created
-    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, assigned_to_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, ass.redmine_id, priority_mapping.redmine_id, auth.redmine_id, datetime(tic.job.created), datetime(tic.job.closed), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping as ass, people_mapping as auth
     WHERE tic.job.query_type_id = tic.query_type.id
     AND tic.query_type.name = rm.trackers.name
     AND tic.job.sweep_id = sweep_mapping.tickets_id
     AND tic.job.status_id = status_mapping.tickets_id
     AND tic.job.severity_id = priority_mapping.tickets_id
-    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.logger_id = auth.tickets_id
+    AND tic.job.assignee_id = ass.tickets_id
     AND tic.job.status_id < 5
     AND tic.job.closed IS NOT NULL
     AND tic.job.resolution IS NOT NULL AND tic.job.resolution != '';
 
 --jobs with an open status, a closed date or not, no resolution text:
 --updated_on gets created, the date is ignored if it exists
-INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, priority_id, author_id, created_on, updated_on, start_date)
-    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, priority_mapping.redmine_id, people_mapping.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
-    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping
+INSERT INTO rm.issues (tracker_id, project_id, subject, description, status_id, assigned_to_id, priority_id, author_id, created_on, updated_on, start_date)
+    SELECT rm.trackers.id, sweep_mapping.redmine_id, tic.job.topic, tic.job.description || " (Tickets id : " || tic.job.id || ")", status_mapping.redmine_id, ass.redmine_id, priority_mapping.redmine_id, auth.redmine_id, datetime(tic.job.created), datetime(tic.job.created), tic.job.created
+    FROM tic.query_type, tic.job, rm.trackers, sweep_mapping, status_mapping, priority_mapping, people_mapping as ass, people_mapping as auth
     WHERE tic.job.query_type_id = tic.query_type.id
     AND tic.query_type.name = rm.trackers.name
     AND tic.job.sweep_id = sweep_mapping.tickets_id
     AND tic.job.status_id = status_mapping.tickets_id
     AND tic.job.severity_id = priority_mapping.tickets_id
-    AND tic.job.logger_id = people_mapping.tickets_id
+    AND tic.job.logger_id = auth.tickets_id
+    AND tic.job.assignee_id = ass.tickets_id
     AND tic.job.status_id < 5
     AND (tic.job.resolution IS NULL OR tic.job.resolution = ''); 
 
